@@ -33,6 +33,38 @@ const SEND_JOB_KINDS = ['inbound_turn', 'followup_turn'] as const;
 const PROACTIVE_SEND_JOB_KIND = 'followup_turn';
 
 /**
+ * O canal pelo qual o job vai SAIR — o mesmo a que o handler chega.
+ *
+ * `inbound_turn` traz `channel_session_id` no payload. O `followup_turn` não:
+ * traz a conversa do atendimento (`service_boundary.conversation_id`, carimbada
+ * por `fn_job_service_boundary`), e é por ela que `followup-turn.ts` acha o
+ * canal. A regra casava só a chave do payload, e nenhum `followup_turn` real a
+ * tem — então o hold de go-live, que existe para segurar exatamente esse job,
+ * nunca o retinha, e o acompanhamento saía com o número ainda em hold. Sem
+ * nenhum dos dois, o job não casa canal nenhum — e falha sozinho no handler,
+ * que também não acharia para onde mandar.
+ *
+ * A conversa casa por TEXTO (`c.id::text`) de propósito: um `::uuid` sobre o
+ * valor do payload lançaria `invalid input syntax` na rodada inteira se um job
+ * trouxesse lixo, e o watchdog pararia de reter qualquer job.
+ */
+const CANAL_DO_JOB = `coalesce(
+         j.payload->>'channel_session_id',
+         (select c.channel_session_id::text from conversations c
+           where c.organization_id = j.organization_id
+             and c.contact_id = j.contact_id
+             and c.id::text = j.payload #>> '{service_boundary,conversation_id}'))`;
+
+/**
+ * O canal que o hold usou fica no job (`held_channel_session_id`), e é por ele
+ * que a liberação casa: recalcular pela conversa poderia não achar canal nenhum
+ * se ela deixasse de casar durante o hold (outro canal, outro contato), e o job
+ * nunca sairia. Job retido antes desta regra só tem `channel_session_id` — que é
+ * justamente o que o reteve.
+ */
+const CANAL_DO_JOB_RETIDO = `coalesce(j.payload->>'held_channel_session_id', j.payload->>'channel_session_id')`;
+
+/**
  * Retém jobs 'pending' de sessão não-WORKING ou sob hold de saúde (run_after =
  * infinity, com o run_after original guardado no payload) e libera quando a
  * sessão volta. Idempotente por construção (marcador held_run_after no payload).
@@ -56,11 +88,16 @@ const PROACTIVE_SEND_JOB_KIND = 'followup_turn';
  *   * hold `block_rate` / `response_rate` — o número já está sendo bloqueado
  *     pelos destinatários. Retém TUDO, como antes: aqui a suspeita recai sobre
  *     o próprio número, e não só sobre a iniciativa do disparo.
+ *
+ * O canal do job é achado por `CANAL_DO_JOB` (o payload, ou a conversa do
+ * atendimento), e o que o hold usou fica em `held_channel_session_id` para a
+ * liberação soltar o mesmo job.
  */
 export async function enforceHolds(harness: pg.Pool): Promise<{ held: number; released: number }> {
   const hold = await harness.query(
     `update job_queue j
-     set payload = jsonb_set(j.payload, '{held_run_after}', to_jsonb(j.run_after)),
+     set payload = jsonb_set(j.payload, '{held_run_after}', to_jsonb(j.run_after))
+                   || jsonb_build_object('held_channel_session_id', s.id::text),
          run_after = 'infinity'
      from channel_sessions s
      left join channel_session_health h
@@ -75,14 +112,14 @@ export async function enforceHolds(harness: pg.Pool): Promise<{ held: number; re
        and j.organization_id = s.organization_id
        and j.status = 'pending'
        and j.kind = any($2::text[])
-       and j.payload->>'channel_session_id' = s.id::text
+       and ${CANAL_DO_JOB} = s.id::text
        and not (j.payload ? 'held_run_after')`,
     [SESSION_HEALTHY_STATUS, [...SEND_JOB_KINDS], PROACTIVE_SEND_JOB_KIND],
   );
   const release = await harness.query(
     `update job_queue j
      set run_after = (j.payload->>'held_run_after')::timestamptz,
-         payload = j.payload - 'held_run_after'
+         payload = j.payload - 'held_run_after' - 'held_channel_session_id'
      from channel_sessions s
      left join channel_session_health h
        on h.organization_id = s.organization_id and h.channel_session_id = s.id
@@ -94,7 +131,7 @@ export async function enforceHolds(harness: pg.Pool): Promise<{ held: number; re
        and j.organization_id = s.organization_id
        and j.status = 'pending'
        and j.payload ? 'held_run_after'
-       and j.payload->>'channel_session_id' = s.id::text`,
+       and ${CANAL_DO_JOB_RETIDO} = s.id::text`,
     [SESSION_HEALTHY_STATUS, PROACTIVE_SEND_JOB_KIND],
   );
   return { held: hold.rowCount ?? 0, released: release.rowCount ?? 0 };
@@ -121,7 +158,7 @@ export async function sessionHealthMetrics(db: Queryable): Promise<SessionHealth
               where j.organization_id = s.organization_id
                 and j.status = 'pending'
                 and j.payload ? 'held_run_after'
-                and j.payload->>'channel_session_id' = s.id::text) as held_jobs
+                and ${CANAL_DO_JOB_RETIDO} = s.id::text) as held_jobs
      from channel_sessions s
      order by s.updated_at desc
      limit 50`,
