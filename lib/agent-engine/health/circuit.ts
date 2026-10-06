@@ -181,11 +181,9 @@ function pct(fraction: number): string {
  * (título e corpo saem do banco como foram gravados, nunca por `t()` na tela).
  */
 export const TITULO_DO_GO_LIVE = 'Número novo aguardando liberação (go-live)';
+// Uma linha só, sem `+`: a catraca do espanhol só resolve const de topo literal.
 export const CORPO_DO_GO_LIVE =
-  'Os retornos automáticos deste número estão parados até você liberar. Eles esperam na fila, ' +
-  'nada é perdido, e voltam espaçados ao longo das horas seguintes. Responder quem te escreveu ' +
-  'continua funcionando normalmente. Marque este item como resolvido quando o número estiver ' +
-  'pronto para disparar.';
+  'Os retornos automáticos deste número estão parados até você liberar. Eles esperam na fila, nada é perdido, e voltam espaçados ao longo das horas seguintes. Responder quem te escreveu continua funcionando normalmente. Marque este item como resolvido quando o número estiver pronto para disparar.';
 
 export function textoDoGoLive(idioma: Idioma): { title: string; body: string } {
   return { title: traduzir(TITULO_DO_GO_LIVE, idioma), body: traduzir(CORPO_DO_GO_LIVE, idioma) };
