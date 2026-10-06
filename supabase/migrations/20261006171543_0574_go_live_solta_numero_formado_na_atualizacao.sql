@@ -1,4 +1,4 @@
--- manifest: **A atualização solta sozinha a trava de número novo do número que já está formado (PR #2327, de @Sandersono; decisão do dono, doc 109, opção A).** O #2327 faz a trava de go-live segurar de verdade os retornos automáticos (`followup_turn`), que até então ela nunca retinha. Sem esta transição, quem atualizasse teria TODO número com o item de go-live aberto parado, inclusive os que operam há meses. `fn_go_live_solta_numero_formado` solta a trava (`health_released_at`), fecha o item da Central (`kind 'other'`, `ref_kind 'number_health'`) e grava `channel.go_live_liberado_na_atualizacao` com o motivo, para o número em que (a) o controle de ritmo já não põe limite de aquecimento — a mesma régua de `lib/agent-engine/pacing/engine.ts` sobre `channel_knobs` (idade ≥ 31 dias, "pular o aquecimento" ou degraus próprios que terminam em "sem limite") — ou (b) a primeira mensagem de saída que saiu de verdade tem ≥ 31 dias. Nunca toca trava de saúde (`block_rate`/`response_rate`, que só existe com `health_released_at` preenchido). Roda UMA vez por instalação: a marca é a linha `channel.go_live_transicao_da_atualizacao` no audit log, com a contagem. Apêndice igual no `baseline.sql`, antes da VARREDURA anon.
+-- manifest: **A atualização solta sozinha a trava de número novo do número que já está formado (PR #2327, de @Sandersono; decisão do dono, doc 109, opção A).** O #2327 faz a trava de go-live segurar de verdade os retornos automáticos (`followup_turn`), que até então ela nunca retinha. Sem esta transição, quem atualizasse teria TODO número com o item de go-live aberto parado, inclusive os que operam há meses. `fn_go_live_solta_numero_formado` solta a trava (`health_released_at`) — ou, no número que ainda não tem linha de saúde (ela só nasce no primeiro aviso de conexão), cria a linha já liberada —, fecha o item da Central (`kind 'other'`, `ref_kind 'number_health'`) e grava `channel.go_live_liberado_na_atualizacao` com o motivo, para o número em que (a) o controle de ritmo já não põe limite de aquecimento — a mesma régua de `lib/agent-engine/pacing/engine.ts` sobre `channel_knobs` (idade ≥ 31 dias, "pular o aquecimento" ou degraus próprios que terminam em "sem limite") — ou (b) a primeira mensagem de saída que saiu de verdade tem ≥ 31 dias. Nunca toca trava de saúde (`block_rate`/`response_rate`, que só existe com `health_released_at` preenchido). Roda UMA vez por instalação: a marca é a linha `channel.go_live_transicao_da_atualizacao` no audit log, com a contagem. Apêndice igual no `baseline.sql`, antes da VARREDURA anon.
 
 -- ============================================================================
 -- 0574 — A TRAVA DE NÚMERO NOVO SAI SOZINHA DO NÚMERO JÁ FORMADO (#2327, doc 109)
@@ -49,8 +49,9 @@ declare
   v_soltos integer;
 begin
   with candidatos as (
-    select h.organization_id,
-           h.channel_session_id,
+    select s.organization_id,
+           s.id as channel_session_id,
+           s.status,
            -- `parseWarmupCaps` + `PACING_DEFAULTS.warmupDailyCaps`: degrau inválido
            -- ou ausente cai no padrão conservador, como no motor.
            case
@@ -67,15 +68,22 @@ begin
            -- `decidePacing`: dias completos desde a ativação, nunca negativo; sem
            -- linha de ritmo, idade 0.
            coalesce(greatest(0, floor(extract(epoch from (now() - k.number_activated_at)) / 86400)), 0) as idade
-      from channel_session_health h
+      -- Parte da SESSÃO, não da linha de saúde: a linha só nasce no primeiro
+      -- aviso de conexão (`lib/channels/health.ts`). Número formado sem ela não
+      -- está travado hoje, mas seria travado como "novo" no primeiro aviso —
+      -- depois de a marca de rodada única já ter fechado esta transição.
+      from channel_sessions s
+      left join channel_session_health h
+        on h.organization_id = s.organization_id and h.channel_session_id = s.id
       left join channel_knobs k
-        on k.organization_id = h.organization_id and k.channel_session_id = h.channel_session_id
+        on k.organization_id = s.organization_id and k.channel_session_id = s.id
      where h.health_released_at is null
        and coalesce(h.health_hold_reason, 'go_live') = 'go_live'
   ),
   formados as (
     select c.organization_id,
            c.channel_session_id,
+           c.status,
            case
              -- `warmupCapFor`: o ÚLTIMO degrau alcançado pela idade; aquém do
              -- primeiro, o primeiro. `cap` null = sem limite de aquecimento.
@@ -98,17 +106,26 @@ begin
            end as motivo
       from candidatos c
   ),
-  soltos as (
-    update channel_session_health h
+  -- Sem linha de saúde, nasce uma já liberada; com linha, ela é solta. O
+  -- `where` do conflito é a segunda guarda da trava de saúde.
+  liberados as (
+    insert into channel_session_health (organization_id, channel_session_id, status, health_released_at)
+    select f.organization_id, f.channel_session_id, f.status, now()
+      from formados f
+     where f.motivo is not null
+    on conflict (organization_id, channel_session_id) do update
        set health_released_at = now(),
            health_hold_active = false,
            health_hold_reason = null,
            updated_at = now()
-      from formados f
-     where f.motivo is not null
-       and h.organization_id = f.organization_id
-       and h.channel_session_id = f.channel_session_id
-    returning h.organization_id, h.channel_session_id, f.motivo
+     where channel_session_health.health_released_at is null
+    returning organization_id, channel_session_id
+  ),
+  soltos as (
+    select l.organization_id, l.channel_session_id, f.motivo
+      from liberados l
+      join formados f
+        on f.organization_id = l.organization_id and f.channel_session_id = l.channel_session_id
   ),
   fechados as (
     update agent_inbox_items i
